@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Tabs Health Q&amp;A skill engine</title></head>
+<body>
+<script>
+// Google AI Edge Gallery JavaScript skill engine.
+// The Gallery calls window['ai_edge_gallery_get_result'](data, secret) and
+// expects a stringified JSON object with either {result: ...} or {error: ...}.
+window['ai_edge_gallery_get_result'] = async (data, secret) => {
+  const BASE = 'https://api.jottracker.com';
+
+  try {
+    var args = {};
+    try { args = JSON.parse(data || '{}'); } catch (e) { args = {}; }
+    var days = parseInt(args.days, 10);
+    if (isNaN(days) || days < 1) days = 14;
+    if (days > 30) days = 30;
+
+    if (!secret || secret.indexOf(':') < 0) {
+      return JSON.stringify({ error: 'Missing secret. Set your Tabs login as email:password in the skill settings.' });
+    }
+    var cut = secret.indexOf(':');
+    var email = secret.slice(0, cut).trim();
+    var password = secret.slice(cut + 1);
+    if (!email || !password) {
+      return JSON.stringify({ error: 'Secret must be formatted as email:password.' });
+    }
+
+    // 1. Log in (short-lived session; closed right after the pull).
+    var loginRes = await fetch(BASE + '/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, password: password })
+    });
+    if (!loginRes.ok) {
+      return JSON.stringify({ error: 'Tabs login failed (HTTP ' + loginRes.status + '). Check the email:password secret.' });
+    }
+    var login = await loginRes.json();
+    if (!login.token) {
+      return JSON.stringify({ error: 'Tabs login did not return a session token.' });
+    }
+
+    // 2. Pull data, then best-effort logout so no session lingers server-side.
+    var pull;
+    try {
+      var pullRes = await fetch(BASE + '/api/sync/pull', {
+        headers: { 'Authorization': 'Bearer ' + login.token }
+      });
+      if (!pullRes.ok) throw new Error('data pull failed (HTTP ' + pullRes.status + ')');
+      pull = await pullRes.json();
+    } finally {
+      try {
+        await fetch(BASE + '/api/auth/logout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refreshToken: login.refreshToken })
+        });
+      } catch (e) { /* cleanup is best-effort */ }
+    }
+
+    // 3. Trim to what a small on-device model can actually use.
+    var cutoff = Date.now() - days * 86400000;
+    var catName = {};
+    (pull.categories || []).forEach(function (c) { catName[c.id] = c.name; });
+
+    var entries = (pull.entries || []).filter(function (e) {
+      var t = new Date(e.timestamp).getTime();
+      return isNaN(t) || t >= cutoff;
+    }).slice(0, 60).map(function (e) {
+      return {
+        date: e.timestamp,
+        category: catName[e.categoryId] || 'uncategorized',
+        text: String(e.body || e.manualText || '').slice(0, 400),
+        chips: e.chips
+      };
+    });
+
+    var p = pull.profile || {};
+    var hrHistory = p.heartRateHistory;
+    if (Array.isArray(hrHistory) && hrHistory.length > 48) hrHistory = hrHistory.slice(-48);
+    var profile = {
+      todaySleepMins: p.todaySleepMins,
+      todayAvgHr: p.todayAvgHr,
+      todayScore: p.todayScore,
+      todaySpikes: p.todaySpikes,
+      todaySleepDebt: p.todaySleepDebt,
+      heartRateHistory: hrHistory,
+      medications: p.medications,
+      conditions: p.conditions,
+      currentStreak: p.currentStreak,
+      bestStreak: p.bestStreak,
+      weeklyScore: p.weeklyScore,
+      loggedDays: p.loggedDays
+    };
+
+    var insights = (pull.insights || []).filter(function (i) { return !i.isDismissed; })
+      .slice(0, 10)
+      .map(function (i) { return { date: i.timestamp, text: String(i.text).slice(0, 300) }; });
+
+    return JSON.stringify({ result: JSON.stringify({
+      fetchedAt: new Date().toISOString(),
+      days: days,
+      profile: profile,
+      entries: entries,
+      insights: insights
+    })});
+  } catch (e) {
+    return JSON.stringify({ error: 'Skill failed: ' + (e && e.message ? e.message : String(e)) });
+  }
+};
+</script>
+</body>
+</html>
